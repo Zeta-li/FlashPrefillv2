@@ -31,6 +31,40 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _apply_sinks_posthoc(out, softmax_lse, sinks):
+    """Apply per-head learnable sinks post-hoc, replacing the in-kernel sink.
+
+    A sink logit s contributes exp(s) to the softmax denominator but nothing
+    to the numerator, so given the sink-free output and LSE:
+        out_sink = out * exp(lse) / (exp(lse) + exp(s)) = out * sigmoid(lse - s)
+    The kernel-returned LSE is natural-log, and FP8's Max_offset domain shift
+    is already compensated in the epilogue, so this is exact for bf16 and fp8
+    alike, with no PackGQA layout ambiguity (applied per query head here).
+
+    Returns the corrected out and the sink-inclusive LSE
+    log(exp(lse) + exp(s)), matching the in-kernel sink's LSE contract
+    (rows with lse = -inf stay -inf). out_accum / softmax_lse_accum partials
+    (num_splits > 1) are left sink-free.
+    """
+    s = sinks.to(torch.float32).reshape(-1)
+    if out.dim() == 4:  # (batch, seqlen, nheads, headdim); lse (batch, nheads, seqlen)
+        scale = torch.sigmoid(softmax_lse.float() - s.view(1, -1, 1))
+        scale = scale.permute(0, 2, 1).unsqueeze(-1)
+        lse_sink = torch.where(torch.isinf(softmax_lse), softmax_lse,
+                               torch.logaddexp(softmax_lse, s.view(1, -1, 1)))
+    else:  # varlen: (total_q, nheads, headdim); lse (nheads, total_q)
+        scale = torch.sigmoid(softmax_lse.float() - s.view(-1, 1))
+        scale = scale.transpose(0, 1).unsqueeze(-1)
+        lse_sink = torch.where(torch.isinf(softmax_lse), softmax_lse,
+                               torch.logaddexp(softmax_lse, s.view(-1, 1)))
+    # Single in-place pass over out (bf16 math; the sigmoid scale's bf16
+    # rounding is below the output's own bf16 rounding noise). out is the
+    # kernel's fresh output and is saved/returned only after this, so the
+    # in-place update is safe for autograd.
+    out.mul_(scale.to(out.dtype))
+    return out, lse_sink
+
+
 def round_multiple(x, m):
     return (x + m - 1) // m * m
 
@@ -530,9 +564,11 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             attention_chunk=attention_chunk,
             softcap=softcap,
-            sinks=sinks,
+            sinks=None,  # sinks applied post-hoc below (in-kernel sink bypassed)
             sm_margin=sm_margin,
         )
+        if sinks is not None:
+            out, softmax_lse = _apply_sinks_posthoc(out, softmax_lse, sinks)
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.softmax_scale = softmax_scale
@@ -628,9 +664,11 @@ class FlashAttnFunc(torch.autograd.Function):
             attention_chunk=attention_chunk,
             softcap=softcap,
             num_splits=num_splits,
-            sinks=sinks,
+            sinks=None,  # sinks applied post-hoc below (in-kernel sink bypassed)
             sm_margin=sm_margin,
         )
+        if sinks is not None:
+            out, softmax_lse = _apply_sinks_posthoc(out, softmax_lse, sinks)
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.softmax_scale = softmax_scale
@@ -738,9 +776,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             block_sparse_idx=block_sparse_idx,
             total_q_tiles=total_q_tiles,
             cu_q_tiles=cu_q_tiles,
-            sinks=sinks,
+            sinks=None,  # sinks applied post-hoc below (in-kernel sink bypassed)
             sm_margin=sm_margin,
         )
+        if sinks is not None:
+            out, softmax_lse = _apply_sinks_posthoc(out, softmax_lse, sinks)
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         if has_block_sparse:
             ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
@@ -1220,12 +1260,14 @@ def flash_attn_with_kvcache(
         block_sparse_idx=block_sparse_idx,
         total_q_tiles=total_q_tiles,
         cu_q_tiles=cu_q_tiles,
-        sinks=sinks,
+        sinks=None,  # sinks applied post-hoc below (in-kernel sink bypassed)
         sm_margin=sm_margin,
         k_mean=k_mean,
         v_mean=v_mean,
         mean_k_block_size=mean_k_block_size,
     )
+    if sinks is not None:
+        out, softmax_lse = _apply_sinks_posthoc(out, softmax_lse, sinks)
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
 

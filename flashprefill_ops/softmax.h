@@ -163,8 +163,34 @@ struct Softmax {
         TensorT scores_scale;
         #pragma unroll
         for (int mi = 0; mi < size(row_sum); ++mi) {
-            // Add sink contribution: exp2(sink_val * log2(e) - row_max * scale_log2)
-            row_sum(mi) += exp2f(sink_val * float(M_LOG2E) - row_max(mi) * softmax_scale_log2);
+            // Add sink contribution: exp2(sink_val * log2(e) - row_max * scale_log2).
+            // For FP8 the exp values (and hence row_sum) live in the 2^Max_offset-scaled
+            // domain, so the sink term must be scaled by the same factor.
+            row_sum(mi) += exp2f(sink_val * float(M_LOG2E) - row_max(mi) * softmax_scale_log2 + float(Max_offset));
+            float sum = row_sum(mi);
+            float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
+            scores_scale(mi) = inv_sum * final_scale;
+            if constexpr (Max_offset != 0) {
+                static constexpr float sum_scale = 1.f / float(1 << Max_offset);
+                sum *= sum_scale;
+            }
+            row_sum(mi) = (sum == 0.f || sum != sum) ? -INFINITY : row_max(mi) * (softmax_scale_log2 * float(M_LN2)) + __logf(sum);
+        }
+        return scores_scale;
+    };
+
+    // Finalize with a per-row learnable sink (PackGQA path).
+    // A packed M tile mixes rows of different query heads, so each fragment row
+    // carries its own head's raw sink logit in sink_frag (shape == row_sum).
+    // Entries of -INFINITY contribute nothing (e.g. split_idx != 0).
+    __forceinline__ __device__ TensorT finalize(float const final_scale, TensorT const &sink_frag) {
+        SumOp<float> sum_op;
+        quad_allreduce_(row_sum, row_sum, sum_op);
+        TensorT scores_scale;
+        #pragma unroll
+        for (int mi = 0; mi < size(row_sum); ++mi) {
+            // Same 2^Max_offset domain correction as the scalar overload (FP8).
+            row_sum(mi) += exp2f(sink_frag(mi) * float(M_LOG2E) - row_max(mi) * softmax_scale_log2 + float(Max_offset));
             float sum = row_sum(mi);
             float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
             scores_scale(mi) = inv_sum * final_scale;

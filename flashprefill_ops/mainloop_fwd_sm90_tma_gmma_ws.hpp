@@ -1614,8 +1614,28 @@ struct CollectiveMainloopFwdSm90 {
             pipeline_v.consumer_release(smem_pipe_read);  // release V, otherwise producers will hang
             ++smem_pipe_read;
             if constexpr (Has_Sink) {
-                float sink_val = (Split && split_idx != 0) ? -INFINITY : float(params.ptr_sinks[bidh]);
-                cute::copy(softmax.finalize(v_descale, sink_val), scores_scale);
+                if constexpr (PackGQA) {
+                    // A packed M tile mixes rows of different query heads, so the
+                    // sink logit must be gathered per row. R is the global packed
+                    // row; q_head = kv_head * g + R % g, the same packing as the
+                    // Triton index builder (r % g cycles within each position).
+                    auto thread_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
+                    Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+                    Tensor tScS = thread_mma_qk.partition_C(cS);
+                    Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol(tScS.layout()));
+                    int const g = params.qhead_per_khead_divmod.divisor;
+                    typename Softmax::TensorT sink_frag;
+                    #pragma unroll
+                    for (int mi = 0; mi < size(sink_frag); ++mi) {
+                        int const R = m_block * kBlockM + get<0>(tScS_rowcol(mi, _0{}));
+                        int const qh = bidh_kv * g + (R - g * params.qhead_per_khead_divmod.divide(R));
+                        sink_frag(mi) = (Split && split_idx != 0) ? -INFINITY : float(params.ptr_sinks[qh]);
+                    }
+                    cute::copy(softmax.finalize(v_descale, sink_frag), scores_scale);
+                } else {
+                    float sink_val = (Split && split_idx != 0) ? -INFINITY : float(params.ptr_sinks[bidh]);
+                    cute::copy(softmax.finalize(v_descale, sink_val), scores_scale);
+                }
             } else {
                 cute::copy(softmax.finalize(v_descale), scores_scale);
             }
@@ -1827,8 +1847,25 @@ struct CollectiveMainloopFwdSm90 {
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             auto scores_scale = [&]() {
                 if constexpr (Has_Sink) {
-                    float sink_val = (Split && split_idx != 0) ? -INFINITY : float(params.ptr_sinks[bidh]);
-                    return softmax.finalize(v_descale, sink_val);
+                    if constexpr (PackGQA) {
+                        // See the per-row sink comment in the intra-WG-overlap consumer.
+                        auto thread_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
+                        Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+                        Tensor tScS = thread_mma_qk.partition_C(cS);
+                        Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol(tScS.layout()));
+                        int const g = params.qhead_per_khead_divmod.divisor;
+                        typename Softmax::TensorT sink_frag;
+                        #pragma unroll
+                        for (int mi = 0; mi < size(sink_frag); ++mi) {
+                            int const R = m_block * kBlockM + get<0>(tScS_rowcol(mi, _0{}));
+                            int const qh = bidh_kv * g + (R - g * params.qhead_per_khead_divmod.divide(R));
+                            sink_frag(mi) = (Split && split_idx != 0) ? -INFINITY : float(params.ptr_sinks[qh]);
+                        }
+                        return softmax.finalize(v_descale, sink_frag);
+                    } else {
+                        float sink_val = (Split && split_idx != 0) ? -INFINITY : float(params.ptr_sinks[bidh]);
+                        return softmax.finalize(v_descale, sink_val);
+                    }
                 } else {
                     return softmax.finalize(v_descale);
                 }
