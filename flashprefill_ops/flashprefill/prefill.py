@@ -339,7 +339,9 @@ class FlashPrefill:
         density = 100.0 * selected / possible if possible else 0.0
         print(
             f"[FlashPrefill] selected={selected}/{possible}, "
-            f"density={density:.2f}%, sparsity={100.0 - density:.2f}%"
+            f"density={density:.2f}%, sparsity={100.0 - density:.2f}%",
+            flush=True,  # server stdout is piped through tee; block buffering
+            # would otherwise swallow these lines until the buffer fills
         )
 
     def block_sparse_attention(

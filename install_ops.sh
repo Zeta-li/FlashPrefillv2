@@ -28,7 +28,8 @@ export FLASH_ATTENTION_FORCE_BUILD=TRUE
 export FLASH_ATTENTION_DISABLE_BACKWARD=TRUE
 export FLASH_ATTENTION_DISABLE_SPLIT=TRUE
 export FLASH_ATTENTION_DISABLE_APPENDKV=TRUE
-export FLASH_ATTENTION_DISABLE_LOCAL=TRUE
+# LOCAL (sliding-window) is kept enabled: welm's SWA layers need it.
+export FLASH_ATTENTION_DISABLE_LOCAL=FALSE
 export FLASH_ATTENTION_DISABLE_SOFTCAP=TRUE
 export FLASH_ATTENTION_DISABLE_SM80=TRUE    # the variable setup.py reads is SM80 (not SM8x)
 export FLASH_ATTENTION_DISABLE_HDIM64=TRUE
@@ -37,11 +38,15 @@ export FLASH_ATTENTION_DISABLE_HDIM192=TRUE
 export MAX_JOBS="${MAX_JOBS:-8}"            # nvcc parallelism; each TU needs ~4-6GB RAM, lower it if OOM
 
 # ---- 3. Build & install (--no-build-isolation is required: the build imports torch) ----
+# --no-deps: all runtime deps (torch/einops/packaging/ninja) are pre-installed.
+# Without it, pip resolves torch's metadata which pins nvidia-cudnn-cu12 to an
+# exact == version; any mismatch with the environment makes pip reinstall cudnn
+# at the end of EVERY install (and clobbers a manually fixed cudnn).
 # If the system CUDA is neither 12.8 nor >= 13.0, setup.py downloads an
 # nvcc 12.6 + ptxas 12.8 toolchain from developer.download.nvidia.com (cached
 # under ~/.flashattn) and needs network access. For offline machines, copy
 # ~/.flashattn from an existing machine or set FLASH_ATTENTION_HOME to a shared cache.
-pip install . --no-build-isolation -v
+pip install . --no-build-isolation --no-deps -v
 
 # ---- 4. Smoke test ----
 cd ..
