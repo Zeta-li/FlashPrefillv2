@@ -46,11 +46,11 @@ _NORMALIZE_NUM_STAGES = 4
 _ATTN_TILE_N = 64
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["batch_size"])
 def _fill_cu_q_tiles_kernel(
     cu_seqlens_q_ptr,
     cu_q_tiles_ptr,
-    batch_size: tl.constexpr,
+    batch_size,
     gqa_ratio: tl.constexpr,
     K_BLOCK_M: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -72,7 +72,7 @@ def _fill_cu_q_tiles_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_k_blocks"])
 def _paged_k_mean_kernel(
     k_ptr,
     k_mean_ptr,
@@ -102,7 +102,7 @@ def _paged_k_mean_kernel(
     num_kv_heads: tl.constexpr,
     gqa_ratio: tl.constexpr,
     page_size: tl.constexpr,
-    max_k_blocks: tl.constexpr,
+    max_k_blocks,
     min_sparse_q_len,
     last_n_blocks,
     K_BLOCK_M: tl.constexpr,
@@ -190,7 +190,7 @@ def _paged_k_mean_kernel(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["total_q_tiles", "max_k_blocks", "scale_log2"])
 def _packgqa_score_select_kernel(
     q_ptr,
     k_mean_ptr,
@@ -214,10 +214,10 @@ def _packgqa_score_select_kernel(
     num_kv_heads: tl.constexpr,
     gqa_ratio: tl.constexpr,
     total_q_tiles,
-    max_k_blocks: tl.constexpr,
+    max_k_blocks,
     min_sparse_q_len,
     last_n_blocks,
-    scale_log2: tl.constexpr,
+    scale_log2,
     abs_threshold,
     attention_sink,
     window_size,
@@ -335,7 +335,7 @@ def _packgqa_score_select_kernel(
     # tile-referenced sums via the per-chunk correction exp2(M_c - M_final);
     # no second GEMM pass and no rescale of previously stored data. run_max
     # starts at -1e30 (finite) so fully-masked lanes contribute exp2(-inf)=0.
-    chunk_stride: tl.constexpr = tl.cdiv(max_k_blocks, K_TILE)
+    chunk_stride = tl.cdiv(max_k_blocks, K_TILE)
     chunk_base = chunk_max_ptr + (kv_head * total_q_tiles + global_q_tile) * chunk_stride
     run_max = tl.full((), -1e30, tl.float32)
     for k_base in range(0, active_k_blocks, K_TILE):
@@ -442,7 +442,7 @@ def _packgqa_score_select_kernel(
     tl.store(out_count_base, count * n_sub - tail_cnt * (n_sub - e_tail))
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["total_q_tiles", "max_k_blocks"])
 def _compact_to_csr_kernel(
     compact_ptr,
     csr_ptr,
@@ -452,7 +452,7 @@ def _compact_to_csr_kernel(
     stride_compact_tile,
     stride_compact_k,
     total_q_tiles,
-    max_k_blocks: tl.constexpr,
+    max_k_blocks,
     N_SUB: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
