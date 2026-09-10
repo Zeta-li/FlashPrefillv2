@@ -27,22 +27,29 @@ else:
 
     flash_attn_3_gpu = torch.ops.flashprefill
 
-def _use_triton_backend() -> bool:
-    """The CUDA/CuTe kernels target sm_90a (Hopper wgmma) and cannot run on
-    Blackwell (sm_100/sm_103). Use the Triton implementation there unless the
-    user overrides via FLASHPREFILL_FORCE_BACKEND=cuda|triton."""
+def _select_backend() -> str:
+    """Pick the attention backend: ``"cuda"`` | ``"triton"`` | ``"cutedsl"``.
+
+    The CUDA/CuTe kernels target sm_90a (Hopper wgmma) and cannot run on
+    Blackwell (sm_100/sm_103); Triton is the default there. A production CuteDSL
+    Blackwell kernel exists but stays opt-in until it is perf-verified: set
+    ``FLASHPREFILL_FORCE_BACKEND=cuda|triton|cutedsl`` to override."""
     force = os.getenv("FLASHPREFILL_FORCE_BACKEND", "").strip().lower()
-    if force == "triton":
-        return True
-    if force == "cuda":
-        return False
+    if force in ("triton", "cuda", "cutedsl"):
+        return force
     if not torch.cuda.is_available():
-        return False
+        return "cuda"
     try:
         major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
     except Exception:
-        return False
-    return major >= 10
+        return "cuda"
+    # Blackwell+ defaults to Triton (safe); CuteDSL remains opt-in.
+    return "triton" if major >= 10 else "cuda"
+
+
+def _use_triton_backend() -> bool:
+    """Back-compat shim: True when the non-CUDA (Triton) path should be used."""
+    return _select_backend() != "cuda"
 
 
 def maybe_contiguous(x):
@@ -1247,9 +1254,8 @@ def flash_attn_with_kvcache(
     """
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
-    if _use_triton_backend():
-        from .block_sparse_attn_triton import flash_attn_with_kvcache_triton
-
+    backend = _select_backend()
+    if backend != "cuda":
         if block_sparse_cu is not None and (
             block_sparse_idx is None or total_q_tiles is None or cu_q_tiles is None
         ):
@@ -1260,6 +1266,38 @@ def flash_attn_with_kvcache(
             cache_seqlens = torch.full(
                 (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
             ).contiguous()
+
+        # CuteDSL Blackwell kernel (opt-in). Supports the full feature set
+        # including zero-order mean correction.
+        use_cutedsl = backend == "cutedsl"
+        if use_cutedsl:
+            from .block_sparse_attn_cutedsl import flash_attn_with_kvcache_cutedsl
+
+            return flash_attn_with_kvcache_cutedsl(
+                q,
+                k_cache,
+                v_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                sinks=sinks,
+                block_sparse_cu=block_sparse_cu,
+                block_sparse_idx=block_sparse_idx,
+                total_q_tiles=total_q_tiles,
+                cu_q_tiles=cu_q_tiles,
+                k_mean=k_mean,
+                v_mean=v_mean,
+                mean_k_block_size=mean_k_block_size,
+                num_splits=num_splits,
+            )
+
+        from .block_sparse_attn_triton import flash_attn_with_kvcache_triton
+
         return flash_attn_with_kvcache_triton(
             q,
             k_cache,
