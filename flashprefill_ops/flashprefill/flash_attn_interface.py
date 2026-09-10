@@ -27,6 +27,24 @@ else:
 
     flash_attn_3_gpu = torch.ops.flashprefill
 
+def _use_triton_backend() -> bool:
+    """The CUDA/CuTe kernels target sm_90a (Hopper wgmma) and cannot run on
+    Blackwell (sm_100/sm_103). Use the Triton implementation there unless the
+    user overrides via FLASHPREFILL_FORCE_BACKEND=cuda|triton."""
+    force = os.getenv("FLASHPREFILL_FORCE_BACKEND", "").strip().lower()
+    if force == "triton":
+        return True
+    if force == "cuda":
+        return False
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+    except Exception:
+        return False
+    return major >= 10
+
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -989,6 +1007,17 @@ def flash_attn_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+    if _use_triton_backend():
+        from .block_sparse_attn_triton import flash_attn_func_triton
+
+        return flash_attn_func_triton(
+            q, k, v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+            sinks=sinks,
+        )
     return FlashAttnFunc.apply(
         q,
         k,
@@ -1218,6 +1247,41 @@ def flash_attn_with_kvcache(
     """
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    if _use_triton_backend():
+        from .block_sparse_attn_triton import flash_attn_with_kvcache_triton
+
+        if block_sparse_cu is not None and (
+            block_sparse_idx is None or total_q_tiles is None or cu_q_tiles is None
+        ):
+            raise ValueError(
+                "block_sparse_cu, block_sparse_idx, total_q_tiles and cu_q_tiles must be provided together"
+            )
+        if cache_seqlens is not None and isinstance(cache_seqlens, int):
+            cache_seqlens = torch.full(
+                (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+            ).contiguous()
+        return flash_attn_with_kvcache_triton(
+            q,
+            k_cache,
+            v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+            sinks=sinks,
+            block_sparse_cu=block_sparse_cu,
+            block_sparse_idx=block_sparse_idx,
+            total_q_tiles=total_q_tiles,
+            cu_q_tiles=cu_q_tiles,
+            k_mean=k_mean,
+            v_mean=v_mean,
+            mean_k_block_size=mean_k_block_size,
+            num_splits=num_splits,
+        )
     if softmax_scale is None:
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
