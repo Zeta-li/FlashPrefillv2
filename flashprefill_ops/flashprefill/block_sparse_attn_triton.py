@@ -165,6 +165,11 @@ def _fp_packgqa_fwd_kernel(
             mask=tok_valid,
             other=0,
         )
+        # int64: physical page ids index a large global KV pool (num_pages can
+        # exceed 2^31 / stride_kp ~= 131072), so page * stride overflows int32
+        # and reads an illegal address. Promote to int64. Covers v_slot below
+        # (same `page`). (Xid 31 illegal-read fix.)
+        page = page.to(tl.int64)
         k_slot = page * stride_kp + (k_tok % PAGE_SIZE) * stride_kt
         k = tl.load(
             KC + k_slot[:, None] + kv_head * stride_kh + dims[None, :],

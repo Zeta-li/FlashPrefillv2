@@ -138,6 +138,10 @@ def _paged_k_mean_kernel(
         other=0,
     )
 
+    # int64: physical page ids index a large global KV pool (num_pages can exceed
+    # 2^31 / stride_k_page ~= 131072), so page * stride overflows int32 and reads
+    # an illegal address. Promote to int64 for the whole offset. (Xid 31 fix.)
+    physical_page = physical_page.to(tl.int64)
     k = tl.load(
         k_ptr
         + physical_page[:, None] * stride_k_page

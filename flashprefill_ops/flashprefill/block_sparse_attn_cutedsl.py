@@ -520,7 +520,13 @@ class FlashPrefillCuteDSL(FlashAttentionForwardAmpere):
 
         # physical page for this logical tile (page_size == n_block_size, so the
         # page id is exactly the row-block index into the flattened KV cache).
-        page = p.mPT[p.batch, tile]
+        # int64: page ids index a large global KV pool (num_pages can exceed
+        # 2^31 / (page_size*num_kv_heads*head_dim) ~= 131072). Used raw as the
+        # local_tile coordinate, `page * row_stride` (== page*16384 here) is
+        # computed in int32 and overflows -> illegal address. Promote to int64
+        # so crd2idx does the whole offset in 64-bit. (Xid 31 fix; mirrors the
+        # triton kernels.)
+        page = cutlass.Int64(p.mPT[p.batch, tile])
 
         # --- load K page -> sK, V page -> sV (up-cast fp8->bf16 handled below) ---
         # mK/mV are flattened to (num_pages*page_size, num_kv_heads, head_dim);

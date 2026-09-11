@@ -391,6 +391,108 @@ class FlashPrefill:
             **attention_kwargs,
         )
 
+    @staticmethod
+    def _rank() -> int:
+        try:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                return dist.get_rank()
+        except Exception:
+            pass
+        return int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+
+    def _page_guard(self, page_table, cache_seqlens, cu_seqlens_q, k_cache):
+        """FLASHPREFILL_PAGE_GUARD=1: catch the production IMA at its true cause.
+
+        The GPU MMU fault (Xid 31, ACCESS_TYPE_VIRT_READ) can ONLY come from a
+        page id that is out of [0, num_pages) for a token < kv_len — any in-range
+        id points to allocated KV and never faults. Both the CSR-index builder
+        (flash_block_sparse_index_triton.py:142) and the attention kernel
+        (block_sparse_attn_triton.py:163-194) load K/V by page id with only a
+        token-validity mask, so a bad id => illegal read that crashes all ranks
+        via a gloo cascade. Here we validate on host FIRST: log the offending
+        (batch, token, page, num_pages) + dump the full page_table, then CLAMP
+        the bad entries to page 0 so the server survives and load can continue.
+        """
+        num_pages = int(k_cache.shape[0])
+        page_size = int(k_cache.shape[1])
+        B, P = page_table.shape
+        kv = cache_seqlens.to(torch.int64)[:B]                      # (B,)
+        needed = (kv + (page_size - 1)) // page_size                # (B,) pages holding valid tokens
+        cols = torch.arange(P, device=page_table.device)[None, :]   # (1,P)
+        valid_cols = cols < needed[:, None]                         # (B,P)
+        pt = page_table.to(torch.int64)
+        bad = valid_cols & ((pt < 0) | (pt >= num_pages))           # (B,P)
+        if not bool(bad.any()):
+            return page_table
+        rank = self._rank()
+        bidx, cidx = torch.nonzero(bad, as_tuple=True)
+        b0, c0 = int(bidx[0]), int(cidx[0])
+        q_of = cu_seqlens_q.to(torch.int64)
+        q_lens = (q_of[1:] - q_of[:-1]).tolist() if q_of.numel() > 1 else []
+        print(
+            f"[PAGE-GUARD] rank={rank} BAD page id(s)={int(bad.sum())} "
+            f"num_pages={num_pages} page_size={page_size} B={B} "
+            f"first@(batch={b0}, logical_page={c0}, token~={c0*page_size}) "
+            f"bad_page_val={int(page_table[b0, c0])} kv_len={int(kv[b0])} "
+            f"q_lens={q_lens} chunked_prefix={int(kv[b0]) - (q_lens[b0] if b0 < len(q_lens) else 0)}",
+            flush=True,
+        )
+        try:
+            torch.save(
+                {"page_table": page_table.detach().cpu(),
+                 "cache_seqlens": cache_seqlens.detach().cpu(),
+                 "cu_seqlens_q": cu_seqlens_q.detach().cpu(),
+                 "num_pages": num_pages, "page_size": page_size,
+                 "bad_batch": bidx.detach().cpu(), "bad_col": cidx.detach().cpu()},
+                f"/tmp/pageguard_rank{rank}.pt.tmp",
+            )
+            os.replace(f"/tmp/pageguard_rank{rank}.pt.tmp", f"/tmp/pageguard_rank{rank}.pt")
+        except Exception as e:
+            print(f"[PAGE-GUARD] dump failed: {e!r}", flush=True)
+        # Keep the server alive: clamp bad entries to a valid page (results for
+        # this request are already compromised; a crash would kill all 8 ranks).
+        return torch.where(bad, torch.zeros_like(pt), pt).to(page_table.dtype)
+
+    def _dump_inputs(
+        self, q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
+        host_q_lens, max_k, softmax_scale, attention_k_descale, attention_kwargs,
+    ) -> None:
+        import os
+        try:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else int(
+                os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+        except Exception:
+            rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+        # Gather referenced pages, remap page_table to compact ids.
+        ref = torch.unique(page_table.flatten())
+        ref = ref[(ref >= 0) & (ref < k_cache.shape[0])]
+        remap = torch.full((k_cache.shape[0],), -1, dtype=torch.long, device=page_table.device)
+        remap[ref] = torch.arange(ref.numel(), device=page_table.device)
+        pt_compact = remap[page_table.long()].to(page_table.dtype)
+        payload = {
+            "q": q.detach().cpu(),
+            "k_cache": k_cache[ref].detach().cpu(),
+            "v_cache": v_cache[ref].detach().cpu(),
+            "page_table": pt_compact.detach().cpu(),
+            "cache_seqlens": cache_seqlens.detach().cpu(),
+            "cu_seqlens_q": cu_seqlens_q.detach().cpu(),
+            "q_lens": list(host_q_lens),
+            "max_cache_seqlen": int(max_k),
+            "softmax_scale": softmax_scale,
+            "attention_k_descale": None if attention_k_descale is None else attention_k_descale.detach().cpu(),
+            "v_descale": None if attention_kwargs.get("v_descale") is None else attention_kwargs["v_descale"].detach().cpu(),
+            "cfg": dict(k_block_m=self.k_block_m, k_block_n=self.k_block_n,
+                        abs_threshold=self.abs_threshold, attention_sink=self.attention_sink,
+                        window_size=self.window_size, last_n_blocks=self.last_n_blocks,
+                        min_sparse_q_len=self.min_sparse_q_len, num_splits=self.num_splits,
+                        use_mean_correction=self.use_mean_correction),
+        }
+        path = f"/tmp/fp_dump_rank{rank}.pt"
+        torch.save(payload, path + ".tmp")
+        os.replace(path + ".tmp", path)  # atomic: file is always complete
+
     def __call__(
         self,
         q: torch.Tensor,
@@ -411,6 +513,8 @@ class FlashPrefill:
         host_q_lens, inferred_max_k = self._host_lengths(
             cu_seqlens_q, cache_seqlens, q_lens, max_cache_seqlen
         )
+        if _env_enabled("FLASHPREFILL_PAGE_GUARD"):
+            page_table = self._page_guard(page_table, cache_seqlens, cu_seqlens_q, k_cache)
         index = None
         if not _env_enabled("FLASHPREFILL_FULL_CAUSAL_INDEX"):
             index = self.index_select(
@@ -425,6 +529,18 @@ class FlashPrefill:
                 q_descale=q_descale,
                 k_descale=k_descale,
                 softmax_scale=softmax_scale,
+            )
+        # DEBUG: FLASHPREFILL_DUMP=1 captures the real crashing inputs. Dump EVERY
+        # sparse-path call (overwrite per rank) right before block_sparse_attention.
+        # With FLASHPREFILL_SYNC_DEBUG=1 the full-attn branch syncs per layer, so
+        # the last-written /tmp/fp_dump_rank{R}.pt per rank IS the faulting call.
+        # No B>1 gate: the observed IMA is B=1 (fresh 4096-tok prefill), so the old
+        # numel()>2 gate never captured it.
+        if _env_enabled("FLASHPREFILL_DUMP") and index is not None:
+            self._dump_inputs(
+                q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
+                host_q_lens, inferred_max_k, softmax_scale,
+                attention_k_descale, attention_kwargs,
             )
         return self.block_sparse_attention(
             q,
